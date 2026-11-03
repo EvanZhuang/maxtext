@@ -157,14 +157,20 @@ _FULL_PRECISION_SUBSTRINGS = (
     "-self_attention-indexer-k_norm-",
     "-self_attention-indexer-weights_proj-",
 )
+# Weights that a specific MaxText model keeps in float32, keyed by model name.
+_MODEL_FULL_PRECISION_SUBSTRINGS = {
+    # `MuseSparkRouterGate` holds its router kernel in float32.
+    "muse-spark-816b-a42b": ("-moe_block-gate-kernel",),
+}
 
 
-def _param_save_dtype(mt_param_key_or_keys, save_dtype: str) -> str:
+def _param_save_dtype(mt_param_key_or_keys, save_dtype: str, model_name: str = "") -> str:
   """Returns float32 for full-precision router/HC/sink/indexer state when saving bfloat16."""
   if save_dtype not in ("bfloat16", DType.BFLOAT16):
     return save_dtype
   keys = mt_param_key_or_keys if isinstance(mt_param_key_or_keys, tuple) else (mt_param_key_or_keys,)
-  if any(k.startswith(_FULL_PRECISION_PREFIXES) or any(sub in k for sub in _FULL_PRECISION_SUBSTRINGS) for k in keys):
+  substrings = _FULL_PRECISION_SUBSTRINGS + _MODEL_FULL_PRECISION_SUBSTRINGS.get(model_name, ())
+  if any(k.startswith(_FULL_PRECISION_PREFIXES) or any(sub in k for sub in substrings) for k in keys):
     return "float32"
   return save_dtype
 
@@ -519,14 +525,16 @@ def _build_single_axis_stacked_tensor(
       The final, assembled NumPy array for the MaxText parameter.
   """
   tensors_to_stack = []
+  sample_shape = target_shape[0] if isinstance(target_shape, list) else target_shape
 
-  axis_to_stack = single_stack_axis(mt_key, config, target_shape)
+  axis_to_stack = single_stack_axis(mt_key, config, sample_shape)
 
   # The hook function needs the shape of an individual slice, not the full stacked tensor.
   # We calculate it by removing the stacking dimension from the final target shape.
-  mt_slice_shape_list = list(target_shape)
-  del mt_slice_shape_list[axis_to_stack]
-  mt_slice_shape = tuple(mt_slice_shape_list)
+  if isinstance(target_shape, list):
+    mt_slice_shape = [s[:axis_to_stack] + s[axis_to_stack + 1 :] for s in target_shape]
+  else:
+    mt_slice_shape = target_shape[:axis_to_stack] + target_shape[axis_to_stack + 1 :]
 
   for hf_key_single in hf_source_keys:
     if isinstance(hf_key_single, (list, tuple)):
@@ -1173,7 +1181,7 @@ def main(
 
       # Step 2: Determine the loading function for hf key
       # based on hf_key form (unscanned, scanned, unscanned with expert stacking, or scanned with expert stacking)
-      param_save_dtype = _param_save_dtype(mt_param_key_or_keys, save_dtype)
+      param_save_dtype = _param_save_dtype(mt_param_key_or_keys, save_dtype, model_key)
       getter = tensor_getter if param_save_dtype == save_dtype else partial(tensor_getter, dtype=param_save_dtype)
       load_fn = _get_hf_loading_function(
           hf_source_keys_or_key,

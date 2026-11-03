@@ -94,6 +94,12 @@ class ParamSaveDtypeTest(unittest.TestCase):
     self.assertEqual(_param_save_dtype("params-decoder-layers_3-mlp-MoeBlock_0-gate-kernel", "bfloat16"), "bfloat16")
     self.assertEqual(_param_save_dtype(("params-a", "params-b"), "bfloat16"), "bfloat16")
 
+  def test_model_specific_float32_params(self):
+    key = "params-decoder-scanned_blocks-layers_0-moe_block-gate-kernel"
+    self.assertEqual(_param_save_dtype(key, "bfloat16", "muse-spark-816b-a42b"), "float32")
+    self.assertEqual(_param_save_dtype(key, "bfloat16", "qwen3-30b-a3b"), "bfloat16")
+    self.assertEqual(_param_save_dtype(key, "bfloat16"), "bfloat16")
+
   def test_non_bf16_save_dtype_unchanged(self):
     self.assertEqual(_param_save_dtype("MoEBiasVar-x", "float8_e4m3fn"), "float8_e4m3fn")
     self.assertEqual(_param_save_dtype("Tid2EidVar-x", "float32"), "float32")
