@@ -63,7 +63,14 @@ import optax
 from maxtext.common import profiler
 from maxtext.configs import pyconfig
 from maxtext.m3 import models as m3_models
-from maxtext.m3.core.sharding import DefaultSharding, Sharding, TensorType, mesh_from_config
+from maxtext.m3.core.sharding import (
+    Sharding,
+    TensorType,
+    _ambient_mesh_is_explicit,
+    mesh_from_config,
+    project_spec_to_mesh,
+    sharding_from_config,
+)
 from maxtext.m3.infra import scan as m3_scan
 from maxtext.optimizers import optimizers
 from maxtext.utils import max_logging
@@ -82,11 +89,17 @@ def batch_spec(sharding: Sharding) -> P:
   return sharding("input_tokens", ("batch", "length"), TensorType.ACTIVATION)
 
 
-def _batch_shards(mesh: Mesh, spec: P) -> int:
-  """Number of ways `spec` splits the batch dimension on `mesh`."""
-  axes = spec[0] if spec else None
+def _axis_shards(mesh: Mesh, spec: P, dim: int) -> int:
+  """Number of ways `spec` splits dimension `dim` on `mesh`."""
+  projected = project_spec_to_mesh(spec, mesh)
+  axes = projected[dim] if len(projected) > dim else None
   axes = () if axes is None else ((axes,) if isinstance(axes, str) else tuple(axes))
   return math.prod(mesh.shape[axis] for axis in axes)
+
+
+def _batch_shards(mesh: Mesh, spec: P) -> int:
+  """Number of ways `spec` splits the batch dimension on `mesh`."""
+  return _axis_shards(mesh, spec, 0)
 
 
 def params_held_per_device(model: nnx.Module) -> float:
@@ -112,7 +125,7 @@ def _synthetic_batch_fn(batch_size: int, seq_len: int, vocab_size: int, mesh: Me
     positions = jnp.broadcast_to(jnp.arange(seq_len, dtype=jnp.int32), (batch_size, seq_len))
     return {"inputs": tokens[:, :-1], "targets": tokens[:, 1:], "positions": positions}
 
-  return jax.jit(body, out_shardings=NamedSharding(mesh, spec))
+  return jax.jit(body, out_shardings=NamedSharding(mesh, project_spec_to_mesh(spec, mesh)))
 
 
 def make_synthetic_batch(config, mesh: Mesh, sharding: Sharding, key: jax.Array) -> dict[str, jax.Array]:
@@ -130,7 +143,15 @@ def make_synthetic_batch(config, mesh: Mesh, sharding: Sharding, key: jax.Array)
 def loss_fn(model: nnx.Module, batch: dict[str, jax.Array]) -> jax.Array:
   """Mean next-token cross entropy, computed in float32."""
   logits = model(batch["inputs"], batch["positions"])
-  losses = optax.softmax_cross_entropy_with_integer_labels(logits.astype(jnp.float32), batch["targets"])
+  logits_fp32 = logits.astype(jnp.float32)
+  if not jax.sharding.get_abstract_mesh().empty and _ambient_mesh_is_explicit():
+    target_spec = jax.typeof(batch["targets"]).sharding.spec
+    losses = jax.sharding.auto_axes(
+        optax.softmax_cross_entropy_with_integer_labels,
+        out_sharding=target_spec,
+    )(logits_fp32, batch["targets"])
+  else:
+    losses = optax.softmax_cross_entropy_with_integer_labels(logits_fp32, batch["targets"])
   return jnp.mean(losses)
 
 
@@ -156,7 +177,7 @@ def train_loop(config) -> float:
   mesh = mesh_from_config(config)
   # The parallelism strategy. The mesh shape decides which of its axes are
   # live; the model is handed the strategy and places its parameters from it.
-  sharding = DefaultSharding()
+  sharding = sharding_from_config(config)
   explicit = all(t == jax.sharding.AxisType.Explicit for t in mesh.axis_types)
   max_logging.log(
       f"m3 loop: mesh {dict(mesh.shape)} over {len(jax.devices())} device(s), "
@@ -177,6 +198,13 @@ def train_loop(config) -> float:
     raise ValueError(
         f"per_device_batch_size={config.per_device_batch_size} gives a global batch of {batch_size}, which does not "
         f"split over the {batch_shards} shards of {spec}."
+    )
+  norm_seq_spec = sharding("decoder_layer_input", ("batch", "norm_length", "embed"), TensorType.ACTIVATION)
+  seq_shards = _axis_shards(mesh, norm_seq_spec, 1)
+  if config.max_target_length % seq_shards:
+    raise ValueError(
+        f"max_target_length={config.max_target_length} is not divisible by the {seq_shards} sequence shards of "
+        f"{norm_seq_spec}."
     )
 
   with jax.set_mesh(mesh):

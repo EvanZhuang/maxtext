@@ -67,9 +67,9 @@ path regexes or heuristics, and nothing re-shards a parameter after it is create
 | Concern | Where | Config |
 | :---- | :---- | :---- |
 | Which logical axis each tensor dimension carries | the model, as `*_metadata={"out_sharding": s(name, axes)}` on every parameter and `s.constrain(x, name, axes)` on key activations | — |
-| Which mesh axis a logical axis lands on | one strategy class per parallelism scheme: `core.sharding.DefaultSharding` (FSDP over `embed`; tensor over `heads`, `kv_heads`, `mlp`, `vocab`; batch over `data` × `fsdp` × `expert`) | — |
-| Mesh shape | `core.sharding.mesh_from_config` → `create_mesh` | `ici_{data,fsdp,tensor,expert}_parallelism`, `dcn_*`; legacy's names and defaults |
-| Auto vs explicit sharding | `create_mesh(explicit=)`; `constrain` dispatches on the mesh in scope | `shard_mode` (`auto`, the default, or `explicit`) |
+| Which mesh axis a logical axis lands on | one strategy class per parallelism scheme: `core.sharding.DefaultSharding` (2D FSDP + expert over `embed`; tensor over `heads`, `kv_heads`, `mlp`, `vocab`; context over `length`; optional Megatron sequence parallelism over `norm_length`; batch over `data` × `fsdp` × `fsdp_transpose` × `expert`) | `sequence_parallel` (`false` by default) |
+| Mesh shape | `core.sharding.mesh_from_config` → `create_mesh` | `ici_{data,pipeline,fsdp,fsdp_transpose,context,tensor,expert}_parallelism`, `dcn_*`, `custom_mesh`, `allow_split_physical_axes`, `optimize_mesh_for_tpu_v6e` |
+| Auto vs explicit sharding | `create_mesh(explicit=)`; `constrain` and `out_sharding` dispatch on the mesh in scope | `shard_mode` (`auto`, the default, or `explicit`) |
 | Input batch layout | the driver asks the strategy (`train/loop.py::batch_spec`) | — |
 
 Parameters are placed by Flax from their metadata the moment they are created, under whatever mesh
@@ -81,18 +81,18 @@ without a word. Both drivers (the m3 loop and the training engine) read placemen
 The loop logs the fraction of parameters each device holds; `100%` means replicated, which is what
 an unannotated model gets.
 
-`shard_mode=explicit` builds an Explicit-typed mesh and parameters place under it, but the forward
-pass does not run yet: `nnx.Embed`'s gather has no `out_sharding` under an explicit mesh (a JAX
-`ShardingTypeError`). A strict `xfail` in `model_sharding_test.py` flips when upstream fixes it;
-until then the training engine's Zero-1 and deferred all-reduce, which require explicit mode, are
-not available to m3 models.
+`shard_mode=explicit` builds an Explicit-typed mesh, normalizes size-1 explicit axes to match the
+training engine and pre-train input shardings, and threads `Sharding.out_sharding` into NNX
+embeddings and projections so both `m3/train/loop.py` and `MaxTextTrainingEngine` (including
+Zero-1 `shard_optimizer_over_data=True`) run end to end. Setting `sequence_parallel=true` enables
+Megatron sequence parallelism on `DefaultSharding`, sharding the residual stream and RMSNorm
+sequence axis across `tensor` (`reduce-scatter` + `all-gather` instead of `all-reduce`).
 
 A model with a novel axis subclasses `DefaultSharding` and delegates the rest; a driver that wants
 another scheme passes `sharding=` to `create_model`. m3 does not read `logical_axis_rules`: the
-strategy class is the rule table, typed and conflict-checked. Legacy parallelism axes the mesh does
-not carry (`sequence`, `context*`, `pipeline`, `autoregressive`, `fsdp_transpose`, `tensor_sequence`,
-`diloco`) and custom mesh layouts (`custom_mesh`, `allow_split_physical_axes`,
-`optimize_mesh_for_tpu_v6e`) are refused with the field named rather than ignored.
+strategy class is the rule table, typed and conflict-checked. Legacy parallelism axes outside
+`MESH_AXIS_NAMES` (`sequence`, `context_usp_ulysses`, `context_autoregressive`, `autoregressive`,
+`tensor_sequence`, `diloco`) are refused with the field named rather than ignored.
 
 Today `qwen3` is fully annotated; Qwen3-VL inherits the decoder and MLP annotations but its
 hand-rolled attention is not yet sharded; GLM-5.3-Flash and Wan carry their own `Sharding`
@@ -111,7 +111,7 @@ bearing for that second driver — breaking them tends to fail silently:
 | Remat and scan wrappers must be path-transparent | Parameter paths feed checkpointing, HF mappings, weight sync, optimizer masks and unscan; an extra path segment breaks them, in several cases without an error |
 | Auxiliary losses fold into the primary loss | Only the primary loss is differentiated; a router loss reported alongside it contributes no gradient |
 | One `Mesh` object shared with the driver | Sharding whose mesh differs from the engine's is silently replaced by full replication |
-| Mesh axes keep legacy's names (`data`, `fsdp`, `tensor`, `expert`) | The engine reads the data axis by name: on a mesh with no axis called `data` it declines Zero-1 (one warning) and deferred gradient all-reduce (silently) |
+| Mesh axes keep legacy's names (`data`, `stage`, `fsdp`, `fsdp_transpose`, `context`, `tensor`, `expert`) | The engine reads the data axis by name: on a mesh with no axis called `data` it declines Zero-1 (one warning) and deferred gradient all-reduce (silently) |
 | No parameter sharding constraints after init | Parameters are sharded once by the initializer; re-asserting collides with the engine's deferred all-reduce and Zero-1 resharding |
 
 ## Tests
