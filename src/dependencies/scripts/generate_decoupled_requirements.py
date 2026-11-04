@@ -60,10 +60,14 @@ EXCLUDED_GCLOUD_PACKAGES = (
 # Versions this environment pins away from the source lock. tokamax imports xprof at module scope
 # from 0.0.13 onwards (still the case in 0.0.16), and maxtext imports tokamax from megablox, so with
 # xprof filtered out above every test that reaches maxtext.layers.moe fails to collect. 0.0.12 is
-# the last release that does not need xprof, so the decoupled environment stays free of the Cloud
-# clients without holding the hardware locks back. Drop this once tokamax no longer requires xprof,
-# or once xprof is safe to install here.
-PINNED_PACKAGES = {"tokamax": "tokamax==0.0.12"}
+# the last release that does not need xprof. Similarly, orbax-checkpoint 0.12.9 added etils[epath-gcs]
+# to its unconditional requirements, which pulls in gcsfs and google-cloud-storage; 0.12.8 is the last
+# release without epath-gcs, so the decoupled environment stays free of the Cloud clients without
+# holding the hardware locks back.
+PINNED_PACKAGES = {
+    "orbax-checkpoint": "orbax-checkpoint==0.12.8",
+    "tokamax": "tokamax==0.0.12",
+}
 # google-pasta is a tensorflow dependency that only provides `pasta`; it has no Cloud surface.
 KEPT_GCLOUD_PACKAGES = ("google-pasta",)
 
