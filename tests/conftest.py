@@ -234,15 +234,17 @@ def pytest_configure(config):
 def clear_jax_compilation_cache():
   """Clears JAX compilation caches and forces garbage collection after each test module.
 
-  Prevents XLA memory accumulation and compilation cache buildup across
-  long test runs while preserving intra-module compilation cache reuse.
+  Runs on every backend, including CPU (it used to skip CPU). xdist workers are long-lived
+  processes that run many modules back to back; clearing once per module bounds how much
+  JAX/XLA cache a worker can carry from module to module, at the cost of a few re-compiles
+  for modules that share shapes, while preserving intra-module compilation cache reuse.
+  Note this does not shrink a worker's RSS by itself (glibc keeps freed heap), so it is a
+  cap on growth, not a fix for memory already retained.
   """
   yield
   try:
-    has_accelerator = any(d.platform in ("tpu", "gpu", "proxy") for d in jax.devices())
-    if has_accelerator:
-      jax.clear_caches()
-      gc.collect()
+    jax.clear_caches()
+    gc.collect()
   except Exception:  # pylint: disable=broad-exception-caught
     pass
 

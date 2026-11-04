@@ -237,6 +237,27 @@ jobs:
               fi
             fi
           fi
+          if [ "${INPUTS_DEVICE_TYPE}" = "cpu" ]; then
+            # CPU flavors run the suite under pytest-xdist inside one container whose cgroup memory
+            # limit (~125 GiB on linux-x86-n4-32) is shared by every worker. A single TrainCompile AOT
+            # compile peaks at 10-16 GB and the worker keeps 6-8 GB afterwards, so -n auto (32 workers)
+            # overcommits the pod and shards get OOM-killed near the end of the run (#6052).
+            # 8 workers leave ~16 GB each. Keep CPU_XDIST_PARALLELISM in tools/dev/calculate_workers.py in sync.
+            CPU_XDIST_WORKERS=8
+            # glibc otherwise creates up to 8*ncores malloc arenas per process, inflating RSS.
+            export MALLOC_ARENA_MAX=2
+            # /tmp may be RAM-backed on the runners, so tempfile output would count against the same
+            # memory budget. Point TMPDIR at the runner work volume instead.
+            TMPDIR="${RUNNER_TEMP:-/tmp}/maxtext-tests"
+            export TMPDIR
+            mkdir -p "${TMPDIR}"
+            # Log the actual budget so a killed shard can be diagnosed from the run log.
+            echo "CPU test budget: nproc=$(nproc) xdist_workers=${CPU_XDIST_WORKERS} TMPDIR=${TMPDIR}"
+            echo "cgroup memory.max: $(cat /sys/fs/cgroup/memory.max 2>/dev/null || cat /sys/fs/cgroup/memory/memory.limit_in_bytes 2>/dev/null || echo unknown)"
+            free -g || true
+            df -h /tmp "${TMPDIR}" || true
+            findmnt -T /tmp 2>/dev/null || mount | grep ' /tmp ' || true
+          fi
           if [ "${INPUTS_TOTAL_WORKERS}" -gt 1 ] && [ "${INPUTS_DEVICE_TYPE}" = "tpu" ] && [[ "${INPUTS_FLAVOR}" == *-unit ]]; then
             # TPU unit flavors: whole test classes stay on one shard (tests/utils/class_split.py), so the first
             # test of a class pays its XLA compile in scheduled and PR runs alike. The rest keep pytest-split
@@ -259,13 +280,13 @@ jobs:
             fi
             if [ "${INPUTS_DEVICE_TYPE}" = "cpu" ]; then
               $PYTHON_EXE -m pip install --quiet pytest-xdist
-              SPLIT_ARGS="--splits ${INPUTS_TOTAL_WORKERS} --group ${INPUTS_WORKER_GROUP} -n auto ${SPLIT_ALGO}"
+              SPLIT_ARGS="--splits ${INPUTS_TOTAL_WORKERS} --group ${INPUTS_WORKER_GROUP} -n ${CPU_XDIST_WORKERS} ${SPLIT_ALGO}"
             else
               SPLIT_ARGS="--splits ${INPUTS_TOTAL_WORKERS} --group ${INPUTS_WORKER_GROUP} ${SPLIT_ALGO}"
             fi
           elif [ "${INPUTS_DEVICE_TYPE}" = "cpu" ]; then
             $PYTHON_EXE -m pip install --quiet pytest-xdist
-            SPLIT_ARGS="-n auto"
+            SPLIT_ARGS="-n ${CPU_XDIST_WORKERS}"
           else
             SPLIT_ARGS=""
           fi

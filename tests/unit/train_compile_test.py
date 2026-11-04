@@ -46,6 +46,33 @@ except Exception:  # pylint: disable=broad-exception-caught
 class TrainCompile(parameterized.TestCase):
   """Tests for the Ahead of Time Compilation functionality, train_compile.py"""
 
+  # Directories the tests below write their `compiled_trainstep_file` into (literal "/tmp/test_*" or gettempdir()).
+  _TMP_DIRS = tuple({"/tmp", gettempdir()})
+
+  @staticmethod
+  def _tmp_test_files():
+    files = set()
+    for d in filter(os.path.isdir, TrainCompile._TMP_DIRS):
+      files.update(e.path for e in os.scandir(d) if e.name.startswith("test_") and e.is_file(follow_symlinks=False))
+    return files
+
+  def setUp(self):
+    # Each test leaves a 70-800 MB serialized executable behind, 68 tests per run, and /tmp may be RAM-backed on the CI
+    # runner, so that counts against the same memory budget as the compiles. Snapshot the temp dirs now and remove any
+    # `test_*` file that appeared during the test. Runs as a cleanup, i.e. after the whole test, so a test may still
+    # read back what it wrote. Files that pre-existed (or were already removed) are left alone / tolerated.
+    super().setUp()
+    before = self._tmp_test_files()
+
+    def _remove_new_tmp_files():
+      for path in self._tmp_test_files() - before:
+        try:
+          os.remove(path)
+        except FileNotFoundError:
+          pass
+
+    self.addCleanup(_remove_new_tmp_files)
+
   def test_save_compiled_v4(self):
     temp_dir = gettempdir()
     compiled_trainstep_file = os.path.join(temp_dir, "test_compiled_v4.pickle")
